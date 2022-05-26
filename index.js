@@ -8,8 +8,6 @@ const { stats, base64 } = require('gatsby-plugin-sharp');
 const cheerio = require('cheerio');
 const slash = require('slash');
 
-// TODO: support uploadFromUrl
-
 const {
   DEFAULT_OPTIONS,
   EMPTY_ALT,
