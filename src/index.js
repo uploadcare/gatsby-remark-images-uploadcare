@@ -1,23 +1,36 @@
+const visitWithParents = require('unist-util-visit-parents');
+const getDefinitions = require('mdast-util-definitions');
+const path = require('path');
+const urlJoin = require('url-join');
+const queryString = require('query-string');
+const isRelativeUrl = require('is-relative-url');
+const { stats, base64 } = require('gatsby-plugin-sharp');
+const cheerio = require('cheerio');
+const slash = require('slash');
+
+// TODO: support uploadFromUrl
+
 const {
   DEFAULT_OPTIONS,
   EMPTY_ALT,
   imageClass,
   imageBackgroundClass,
   imageWrapperClass,
-} = require(`./constants`)
-const visitWithParents = require(`unist-util-visit-parents`)
-const getDefinitions = require(`mdast-util-definitions`)
-const path = require(`path`)
-const queryString = require(`query-string`)
-const isRelativeUrl = require(`is-relative-url`)
-const _ = require(`lodash`)
-const { fluid, stats, traceSVG } = require(`gatsby-plugin-sharp`)
-const Promise = require(`bluebird`)
-const cheerio = require(`cheerio`)
-const { slash } = require(`gatsby-core-utils`)
-const chalk = require(`chalk`)
+  UPLOADCARE_CDN,
+  UPLOADCARE_CDN_MAX_DIMENSION_DEFAULT,
+} = require('./constants');
+const { uploadClient, compileUCCDNUrl } = require('./uploadcare-utils');
+const {
+  CACHE_KEY_UC_FILES,
+  getProjectFilesFromCache,
+  readFile,
+  copyFile,
+  sleep,
+  escape,
+  exists,
+  mkdir
+} = require('./utils');
 
-// Should be the same as https://github.com/gatsbyjs/gatsby/blob/master/packages/gatsby-transformer-sharp/src/supported-extensions.js
 const supportedExtensions = {
   jpeg: true,
   jpg: true,
@@ -25,7 +38,98 @@ const supportedExtensions = {
   webp: true,
   tif: true,
   tiff: true,
-}
+  gif: true,
+};
+
+const getOptimizedImageData = ({
+  src,
+  name,
+  width,
+  options,
+  imageOperations,
+}) => {
+  const { maxWidth } = options;
+
+  if (maxWidth < 1) {
+    throw new Error(
+      `${maxWidth} has to be a positive int larger than zero (> 0), now it's ${maxWidth}`
+    );
+  } // Create sizes (in width) for the image if no custom breakpoints are
+  // provided. If the max width of the container for the rendered markdown file
+  // is 800px, the sizes would then be: 200, 400, 800, 1200, 1600.
+  //
+  // This is enough sizes to provide close to the optimal image size for every
+  // device size / screen resolution while (hopefully) not requiring too much
+  // image processing time (Sharp has optimizations thankfully for creating
+  // multiple sizes of the same input file)
+
+  const fluidSizes = [maxWidth]; // use standard breakpoints if no custom breakpoints are specified
+
+  if (!options.srcSetBreakpoints || !options.srcSetBreakpoints.length) {
+    fluidSizes.push(maxWidth / 4, maxWidth / 2, maxWidth * 1.5, maxWidth * 2);
+  } else {
+    options.srcSetBreakpoints.forEach((breakpoint) => {
+      if (breakpoint < 1) {
+        throw new Error(
+          `All ints in srcSetBreakpoints should be positive ints larger than zero (> 0), found ${breakpoint}`
+        );
+      } // ensure no duplicates are added
+
+      if (fluidSizes.includes(breakpoint)) {
+        return;
+      }
+
+      fluidSizes.push(breakpoint);
+    });
+  }
+
+  let filteredSizes = [
+    ...fluidSizes.filter((size) => size < width),
+    width,
+  ].sort((a, b) => a - b);
+  // Add the original image to ensure the largest image possible
+  // is available for small images. Also so we can link to
+  // the original image.
+  // Queue sizes for processing.
+
+  const hasSizeLargerThenLimit =
+    filteredSizes[filteredSizes.length - 1] >
+    UPLOADCARE_CDN_MAX_DIMENSION_DEFAULT;
+  if (hasSizeLargerThenLimit) {
+    filteredSizes = [
+      ...filteredSizes.filter(
+        (size) => size <= UPLOADCARE_CDN_MAX_DIMENSION_DEFAULT
+      ),
+      UPLOADCARE_CDN_MAX_DIMENSION_DEFAULT,
+    ];
+  }
+
+  const presentationWidth = Math.min(width, maxWidth);
+  const sizes =
+    options.sizes ||
+    `(max-width: ${presentationWidth}px) 100vw, ${presentationWidth}px`;
+  const srcSet = filteredSizes
+    .map(
+      (size) =>
+        `${compileUCCDNUrl({
+          src,
+          fileName: name,
+          options: {
+            ...options.imageOperations,
+            ...imageOperations,
+            resize: `${size}x`,
+          },
+        })} ${Math.round(size)}w`
+    )
+    .join(`,\n`);
+
+  return {
+    sizes,
+    srcSet,
+  };
+};
+
+const uploadingMap = new Map();
 
 // If the image is relative (not hosted elsewhere)
 // 1. Find the image file
@@ -33,62 +137,66 @@ const supportedExtensions = {
 // 3. Filter out any responsive image fluid sizes that are greater than the image's width
 // 4. Create the responsive images.
 // 5. Set the html w/ aspect ratio helper.
-module.exports = (
+module.exports = async (
   {
     files,
     markdownNode,
     markdownAST,
-    pathPrefix,
     getNode,
     reporter,
     cache,
     compiler,
+    getCache,
     getRemarkFileDependency,
+    pathPrefix
   },
   pluginOptions
 ) => {
-  const options = _.defaults({}, pluginOptions, { pathPrefix }, DEFAULT_OPTIONS)
+  const options = {
+    ...DEFAULT_OPTIONS,
+    ...pluginOptions,
+  };
 
   const findParentLinks = ({ children }) =>
     children.some(
-      node =>
+      (node) =>
         (node.type === `html` && !!node.value.match(/<a /)) ||
         node.type === `link`
-    )
+    );
 
   // Get all the available definitions in the markdown tree
-  const definitions = getDefinitions(markdownAST)
+  const definitions = getDefinitions(markdownAST);
 
   // This will allow the use of html image tags
   // const rawHtmlNodes = select(markdownAST, `html`)
-  const rawHtmlNodes = []
+  const rawHtmlNodes = [];
   visitWithParents(markdownAST, [`html`, `jsx`], (node, ancestors) => {
-    const inLink = ancestors.some(findParentLinks)
+    const inLink = ancestors.some(findParentLinks);
 
-    rawHtmlNodes.push({ node, inLink })
-  })
+    rawHtmlNodes.push({ node, inLink });
+  });
 
   // This will only work for markdown syntax image tags
-  const markdownImageNodes = []
+  const markdownImageNodes = [];
 
   visitWithParents(
     markdownAST,
     [`image`, `imageReference`],
     (node, ancestors) => {
-      const inLink = ancestors.some(findParentLinks)
+      const inLink = ancestors.some(findParentLinks);
 
-      markdownImageNodes.push({ node, inLink })
+      markdownImageNodes.push({ node, inLink });
     }
-  )
+  );
 
-  const getImageInfo = uri => {
-    const { url, query } = queryString.parseUrl(uri)
+  const getImageInfo = (uri) => {
+    const { url, query } = queryString.parseUrl(uri);
     return {
       ext: path.extname(url).split(`.`).pop(),
       url,
       query,
-    }
-  }
+    };
+  };
 
   const getImageCaption = async (node, overWrites) => {
     const getCaptionString = () => {
@@ -96,42 +204,44 @@ module.exports = (
         ? options.showCaptions
         : options.showCaptions === true
         ? [`title`, `alt`]
-        : false
+        : false;
 
       if (captionOptions) {
         for (const option of captionOptions) {
           switch (option) {
             case `title`:
               if (node.title) {
-                return node.title
+                return node.title;
               }
-              break
+              break;
             case `alt`:
               if (node.alt === EMPTY_ALT || overWrites.alt === EMPTY_ALT) {
-                return ``
+                return ``;
               }
               if (overWrites.alt) {
-                return overWrites.alt
+                return overWrites.alt;
               }
               if (node.alt) {
-                return node.alt
+                return node.alt;
               }
-              break
+              break;
           }
         }
       }
 
-      return ``
-    }
+      return ``;
+    };
 
-    const captionString = getCaptionString()
+    const captionString = getCaptionString();
 
     if (!options.markdownCaptions || !compiler) {
-      return _.escape(captionString)
+      return escape(captionString);
     }
 
-    return compiler.generateHTML(await compiler.parseString(captionString))
-  }
+    return compiler.generateHTML(await compiler.parseString(captionString));
+  };
+
+  const ucClient = uploadClient.getInstance(options.pubkey);
 
   // Takes a node and generates the needed images and then returns
   // the needed HTML replacement for the image
@@ -143,112 +253,189 @@ module.exports = (
   ) {
     // Check if this markdownNode has a File parent. This plugin
     // won't work if the image isn't hosted locally.
-    let parentNode = getNode(markdownNode.parent)
+    let parentNode = getNode(markdownNode.parent);
     // check if the parent node is a File node, otherwise go up the chain and
     // search for the closest parent File node. This is necessary in case
-    // you have markdown in child nodes (e.g. gatsby-plugin-json-remark).
+    // you have markdown in child nodes.
     if (
       parentNode &&
       parentNode.internal &&
       parentNode.internal.type !== `File`
     ) {
-      let tempParentNode = parentNode
+      let tempParentNode = parentNode;
       while (
         tempParentNode &&
         tempParentNode.internal &&
         tempParentNode.internal.type !== `File`
       ) {
-        tempParentNode = getNode(tempParentNode.parent)
+        tempParentNode = getNode(tempParentNode.parent);
       }
       if (
         tempParentNode &&
         tempParentNode.internal &&
         tempParentNode.internal.type === `File`
       ) {
-        parentNode = tempParentNode
+        parentNode = tempParentNode;
       }
     }
-    let imagePath
+    let imagePath;
     if (parentNode && parentNode.dir) {
-      imagePath = slash(path.join(parentNode.dir, getImageInfo(node.url).url))
+      imagePath = slash(path.join(parentNode.dir, getImageInfo(node.url).url));
     } else {
-      return null
+      return null;
     }
 
-    let imageNode
+    let imageNode;
     if (getRemarkFileDependency) {
       imageNode = await getRemarkFileDependency({
         absolutePath: {
           eq: imagePath,
         },
-      })
+      });
     } else {
       // Legacy: no context, slower version of image query
-      imageNode = _.find(files, file => {
-        if (file && file.absolutePath) {
-          return file.absolutePath === imagePath
-        }
-        return null
-      })
+      imageNode = files.find(
+        (file) => file && file.absolutePath && file.absolutePath === imagePath
+      );
     }
 
     if (!imageNode || !imageNode.absolutePath) {
-      return resolve()
+      return resolve();
     }
 
-    const fluidResult = await fluid({
-      file: imageNode,
-      args: options,
-      reporter,
-      cache,
-    })
+    const imageNodeName = `${imageNode.name}.${imageNode.extension}`;
+    const { query: imageOperations } = queryString.parseUrl(node.url);
+    const noProcess = Object.prototype.hasOwnProperty.call(imageOperations, 'noProcess');
 
-    if (!fluidResult) {
-      return resolve()
+    if (noProcess) {
+      const dir = path.join(process.cwd(), 'public', 'static', imageNode.internal.contentDigest);
+
+      if (!(await exists(dir))) {
+        await mkdir(dir, { recursive: true });
+      }
+      if (!(await exists(imagePath))) {
+        await copyFile(imagePath, path.join(dir, imageNodeName));
+      }
     }
 
-    const originalImg = fluidResult.originalImg
-    const fallbackSrc = fluidResult.src
-    const srcSet = fluidResult.srcSet
-    const presentationWidth = fluidResult.presentationWidth
+    const projectFiles = await getProjectFilesFromCache({ getCache, cache });
 
-    // Generate default alt tag
-    const srcSplit = getImageInfo(node.url).url.split(`/`)
-    const fileName = srcSplit[srcSplit.length - 1]
-    const fileNameNoExt = fileName.replace(/\.[^/.]+$/, ``)
-    const defaultAlt = fileNameNoExt.replace(/[^A-Z0-9]/gi, ` `)
-    const isEmptyAlt = node.alt === EMPTY_ALT
+    let ucImg = projectFiles.find(
+      (item) =>
+        item &&
+        item.metadata &&
+        item.metadata.contentDigest === imageNode.internal.contentDigest
+    );
 
+    if (!ucImg) {
+      if (uploadingMap.has(imageNode.internal.contentDigest)) {
+        // prevent upload same file, it's improve build time and decrease uploads
+        ucImg = uploadingMap.get(imageNode.internal.contentDigest);
+        if (ucImg === null) {
+          await sleep(3000);
+          return generateImagesAndUpdateNode(node, resolve, inLink, overWrites);
+        }
+      } else {
+        uploadingMap.set(imageNode.internal.contentDigest, null);
+      }
+
+      const uploadFile = async () => {
+        const file = await readFile(imageNode.absolutePath);
+
+        try {
+          ucImg = await ucClient.uploadFile(file, {
+            fileName: imageNodeName,
+            metadata: {
+              contentDigest: imageNode.internal.contentDigest,
+            },
+          });
+          uploadingMap.set(imageNode.internal.contentDigest, ucImg);
+          await cache.set(CACHE_KEY_UC_FILES, [
+            ...(await getProjectFilesFromCache({ getCache, cache })),
+            ucImg,
+          ]);
+        } catch (e) {
+          // problem in node in localhost, with resolve DNS. Solve - retry after some timeout.
+          if (e.code === 'ENOTFOUND') {
+            await sleep(5000);
+            await uploadFile();
+          }
+
+          const isThrottled =
+            e &&
+            e.response &&
+            e.response.error &&
+            e.response.error.statusCode === 429;
+          if (isThrottled) {
+            await sleep(Math.ceil(e.headers['retry-after']) * 1000);
+            await uploadFile();
+          } else {
+            return resolve();
+          }
+        }
+
+        return ucImg;
+      };
+
+      await uploadFile();
+    }
+
+    if (!ucImg) {
+      resolve();
+    }
+
+    // difference response in res-api(/files) and UploadClient(@uploadcare/upload-client)
+    const image =
+      (ucImg.content_info && ucImg.content_info.image) ||
+      (ucImg.contentInfo && ucImg.contentInfo.image);
+
+    const imageName = (ucImg.original_file_url || ucImg.originalFilename)
+      .split('/')
+      .slice(-1)[0];
+    const imageUrl = urlJoin(UPLOADCARE_CDN, ucImg.uuid);
+
+    const optimizedImageUrl = compileUCCDNUrl({
+      src: imageUrl,
+      fileName: imageName,
+      options: {
+        ...options.imageOperations,
+        ...imageOperations,
+        resize: image.width >= options.maxWidth ? `${options.maxWidth}x` : null,
+      },
+    });
+
+    const { srcSet, sizes } = getOptimizedImageData({
+      name: imageName,
+      src: imageUrl,
+      width: image.width,
+      options,
+      imageOperations,
+    });
+    const presentationWidth = Math.min(image.width, options.maxWidth);
+    const aspectRatio = image.width / image.height;
+    const ratio = `${(1 / aspectRatio) * 100}%`;
+    const isEmptyAlt = node.alt === EMPTY_ALT;
     const alt = isEmptyAlt
       ? ``
-      : _.escape(
-          overWrites.alt ? overWrites.alt : node.alt ? node.alt : defaultAlt
-        )
+      : escape(overWrites.alt || node.alt || imageNode.name);
+    const title = node.title ? escape(node.title) : alt;
 
-    const title = node.title ? _.escape(node.title) : alt
-
-    const loading = options.loading
-
+    const { loading } = options;
     if (![`lazy`, `eager`, `auto`].includes(loading)) {
       reporter.warn(
         reporter.stripIndent(`
-        ${chalk.bold(loading)} is an invalid value for the ${chalk.bold(
-          `loading`
-        )} option. Please pass one of "lazy", "eager" or "auto".
+        ${loading} is an invalid value for the loading option. Please pass one of "lazy", "eager" or "auto".
       `)
-      )
+      );
     }
 
-    const decoding = options.decoding
-
+    const { decoding } = options;
     if (![`async`, `sync`, `auto`].includes(decoding)) {
       reporter.warn(
         reporter.stripIndent(`
-        ${chalk.bold(decoding)} is an invalid value for the ${chalk.bold(
-          `decoding`
-        )} option. Please pass one of "async", "sync" or "auto".
+        ${decoding} is an invalid value for the decoding option. Please pass one of "async", "sync" or "auto".
       `)
-      )
+      );
     }
 
     const imageStyle = `
@@ -258,7 +445,7 @@ module.exports = (
       vertical-align: middle;
       position: absolute;
       top: 0;
-      left: 0;`.replace(/\s*(\S+:)\s*/g, `$1`)
+      left: 0;`.replace(/\s*(\S+:)\s*/g, `$1`);
 
     // Create our base image tag
     let imageTag = `
@@ -266,137 +453,73 @@ module.exports = (
         class="${imageClass}"
         alt="${alt}"
         title="${title}"
-        src="${fallbackSrc}"
         srcset="${srcSet}"
-        sizes="${fluidResult.sizes}"
+        sizes="${sizes}"
+        src="${optimizedImageUrl}"
         style="${imageStyle}"
         loading="${loading}"
         decoding="${decoding}"
       />
-    `.trim()
+    `.trim();
 
-    const formatConfigs = [
-      {
-        propertyName: `withAvif`,
-        format: `AVIF`,
-      },
-      {
-        propertyName: `withWebp`,
-        format: `WEBP`,
-      },
-    ]
+    if (image.sequence) {
+      // process gif to video
+      imageTag = `
+      <video class="${imageClass}" style="${imageStyle}" autoplay loop webkit-playsinline playsinline muted>
+        <source src="${urlJoin(
+          imageUrl,
+          '/gif2video/-/format/webm/'
+        )}" type="video/webm"/>
+        <source src="${urlJoin(
+          imageUrl,
+          '/gif2video/-/format/mp4/'
+        )}" type="video/mp4"/>
+      </video>
+    `.trim();
+    }
 
-    const enabledFormatConfigs = formatConfigs.filter(
-      ({ propertyName }) => options[propertyName]
-    )
-
-    if (enabledFormatConfigs.length) {
-      const sourcesHtmlPromises = enabledFormatConfigs.map(
-        async ({ format, propertyName }) => {
-          const formatFluidResult = await fluid({
-            file: imageNode,
-            args: _.defaults(
-              { toFormat: format },
-              // override options if it's an object, otherwise just pass through defaults
-              options[propertyName] === true ? {} : options[propertyName],
-              options
-            ),
-            reporter,
-          })
-
-          if (!formatFluidResult) {
-            return null
-          }
-
-          return `
-            <source
-              srcset="${formatFluidResult.srcSet}"
-              sizes="${formatFluidResult.sizes}"
-              type="${formatFluidResult.srcSetType}"
-            />
-          `.trim()
-        }
-      )
-
-      const sourcesHtml = (await Promise.all(sourcesHtmlPromises)).filter(
-        sourceHtml => sourceHtml !== null
-      )
-
-      if (!sourcesHtml.length) {
-        return resolve()
-      }
+    if (noProcess) {
+      const prefixedSrc = `${pathPrefix || ``  }/static/${imageNode.internal.contentDigest}/${imageNodeName}`;
 
       imageTag = `
-        <picture>
-          ${sourcesHtml.join(``)}
-          <source
-            srcset="${srcSet}"
-            sizes="${fluidResult.sizes}"
-            type="${fluidResult.srcSetType}"
-          />
-          <img
-            class="${imageClass}"
-            src="${fallbackSrc}"
-            alt="${alt}"
-            title="${title}"
-            loading="${loading}"
-            decoding="${decoding}"
-            style="${imageStyle}"
-          />
-        </picture>
-      `.trim()
+      <img
+        class="${imageClass}"
+        alt="${alt}"
+        title="${title}"
+        src="${prefixedSrc}"
+        style="${imageStyle}"
+        loading="${loading}"
+        decoding="${decoding}"
+      />
+    `.trim();
     }
 
-    let placeholderImageData = fluidResult.base64
-
-    // if options.tracedSVG is enabled generate the traced SVG and use that as the placeholder image
-    if (options.tracedSVG) {
-      let args = typeof options.tracedSVG === `object` ? options.tracedSVG : {}
-
-      // Translate Potrace constants (e.g. TURNPOLICY_LEFT, COLOR_AUTO) to the values Potrace expects
-      const { Potrace } = require(`@gatsbyjs/potrace`)
-      const argsKeys = Object.keys(args)
-      args = argsKeys.reduce((result, key) => {
-        const value = args[key]
-        result[key] = Potrace.hasOwnProperty(value) ? Potrace[value] : value
-        return result
-      }, {})
-
-      const tracedSVG = await traceSVG({
-        file: imageNode,
-        args,
-        fileArgs: args,
-        cache,
-        reporter,
-      })
-
-      // Escape single quotes so the SVG data can be used in inline style attribute with single quotes
-      placeholderImageData = tracedSVG.replace(/'/g, `\\'`)
-    }
-
-    const ratio = `${(1 / fluidResult.aspectRatio) * 100}%`
-
-    const wrapperStyle =
-      typeof options.wrapperStyle === `function`
-        ? options.wrapperStyle(fluidResult)
-        : options.wrapperStyle
+    const base64Image = await base64({
+      file: imageNode,
+      reporter,
+      cache,
+    });
 
     // Construct new image node w/ aspect ratio placeholder
     const imageCaption =
-      options.showCaptions && (await getImageCaption(node, overWrites))
+      options.showCaptions && (await getImageCaption(node, overWrites));
 
-    let removeBgImage = false
+    let removeBgImage = false;
     if (options.disableBgImageOnAlpha) {
-      const imageStats = await stats({ file: imageNode, reporter })
-      if (imageStats && imageStats.isTransparent) removeBgImage = true
+      const imageStats = await stats({ file: imageNode, reporter });
+      if (imageStats && imageStats.isTransparent) removeBgImage = true;
     }
     if (options.disableBgImage) {
-      removeBgImage = true
+      removeBgImage = true;
+    }
+    // remove bg image for gif
+    if (image.sequence) {
+      removeBgImage = true;
     }
 
     const bgImage = removeBgImage
       ? ``
-      : ` background-image: url('${placeholderImageData}'); background-size: cover;`
+      : ` background-image: url('${base64Image.src}'); background-size: cover;`;
 
     let rawHTML = `
   <span
@@ -404,70 +527,70 @@ module.exports = (
     style="padding-bottom: ${ratio}; position: relative; bottom: 0; left: 0;${bgImage} display: block;"
   ></span>
   ${imageTag}
-  `.trim()
+  `.trim();
 
     // Make linking to original image optional.
     if (!inLink && options.linkImagesToOriginal) {
       rawHTML = `
   <a
     class="gatsby-resp-image-link"
-    href="${originalImg}"
+    href="${urlJoin(imageUrl, imageName)}"
     style="display: block"
     target="_blank"
     rel="noopener"
   >
     ${rawHTML}
   </a>
-    `.trim()
+    `.trim();
     }
 
     rawHTML = `
     <span
       class="${imageWrapperClass}"
       style="position: relative; display: block; margin-left: auto; margin-right: auto; max-width: ${presentationWidth}px; ${
-      imageCaption ? `` : wrapperStyle
+      imageCaption ? `` : options.wrapperStyle
     }"
     >
       ${rawHTML}
     </span>
-    `.trim()
+    `.trim();
 
     // Wrap in figure and use title as caption
     if (imageCaption) {
       rawHTML = `
-  <figure class="gatsby-resp-image-figure" style="${wrapperStyle}">
+  <figure class="gatsby-resp-image-figure" style="${options.wrapperStyle}">
     ${rawHTML}
     <figcaption class="gatsby-resp-image-figcaption">${imageCaption}</figcaption>
   </figure>
-      `.trim()
+      `.trim();
     }
 
-    return rawHTML
-  }
+    return rawHTML;
+  };
 
   return Promise.all(
     // Simple because there is no nesting in markdown
     markdownImageNodes.map(
       ({ node, inLink }) =>
-        new Promise(resolve => {
-          const overWrites = {}
-          let refNode
+        new Promise((resolve) => {
+          const overWrites = {};
+          let refNode;
           if (
-            !node.hasOwnProperty(`url`) &&
-            node.hasOwnProperty(`identifier`)
+            !node.hasOwnProperty('url') &&
+            node.hasOwnProperty('identifier')
           ) {
             // consider as imageReference node
-            refNode = node
-            node = definitions(refNode.identifier)
+            refNode = node;
+            node = definitions(refNode.identifier);
             // pass original alt from referencing node
-            overWrites.alt = refNode.alt
+            overWrites.alt = refNode.alt;
             if (!node) {
               // no definition found for image reference,
               // so there's nothing for us to do.
-              return resolve()
+              return resolve();
             }
           }
-          const fileType = getImageInfo(node.url).ext
+          const fileType = getImageInfo(node.url).ext;
 
           // Only attempt to convert supported extensions
           if (isRelativeUrl(node.url) && supportedExtensions[fileType]) {
@@ -476,60 +599,59 @@ module.exports = (
               resolve,
               inLink,
               overWrites
-            ).then(rawHTML => {
+            ).then((rawHTML) => {
               if (rawHTML) {
                 // Replace the image or ref node with an inline HTML node.
                 if (refNode) {
-                  node = refNode
+                  node = refNode;
                 }
-                node.type = `html`
-                node.value = rawHTML
+                node.type = `html`;
+                node.value = rawHTML;
               }
 
-              return resolve(node)
-            })
-          } else {
-            // Image isn't relative so there's nothing for us to do.
-            return resolve()
+              return resolve(node);
+            });
           }
+          // Image isn't relative so there's nothing for us to do.
+          return resolve();
         })
     )
-  ).then(markdownImageNodes =>
+  ).then((markdownImageNodes) =>
     // HTML image node stuff
     Promise.all(
       // Complex because HTML nodes can contain multiple images
       rawHtmlNodes.map(
         ({ node, inLink }) =>
           // eslint-disable-next-line no-async-promise-executor
-          new Promise(async (resolve, reject) => {
+          new Promise(async (resolve) => {
             if (!node.value) {
-              return resolve()
+              return resolve();
             }
 
-            const $ = cheerio.load(node.value)
-            if ($(`img`).length === 0) {
-              // No img tags
-              return resolve()
+            const $ = cheerio.load(node.value);
+            const $imageElements = $(`img`);
+            if ($imageElements.length === 0) {
+              // No img tags>
+              return resolve();
             }
 
-            const imageRefs = []
-            $(`img`).each(function () {
-              // eslint-disable-next-line @babel/no-invalid-this
-              imageRefs.push($(this))
-            })
+            const imageRefs = [];
+            $imageElements.each(function () {
+              imageRefs.push($(this));
+            });
 
             for (const thisImg of imageRefs) {
               // Get the details we need.
-              const formattedImgTag = {}
-              formattedImgTag.url = thisImg.attr(`src`)
-              formattedImgTag.title = thisImg.attr(`title`)
-              formattedImgTag.alt = thisImg.attr(`alt`)
+              const formattedImgTag = {};
+              formattedImgTag.url = thisImg.attr(`src`);
+              formattedImgTag.title = thisImg.attr(`title`);
+              formattedImgTag.alt = thisImg.attr(`alt`);
 
               if (!formattedImgTag.url) {
-                return resolve()
+                return resolve();
               }
 
-              const fileType = getImageInfo(formattedImgTag.url).ext
+              const fileType = getImageInfo(formattedImgTag.url).ext;
 
               // Only attempt to convert supported extensions
               if (
@@ -540,26 +662,26 @@ module.exports = (
                   formattedImgTag,
                   resolve,
                   inLink
-                )
+                );
 
                 if (rawHTML) {
                   // Replace the image string
-                  thisImg.replaceWith(rawHTML)
+                  thisImg.replaceWith(rawHTML);
                 } else {
-                  return resolve()
+                  return resolve();
                 }
               }
             }
 
             // Replace the image node with an inline HTML node.
-            node.type = `html`
-            node.value = $(`body`).html() // fix for cheerio v1
+            node.type = 'html';
+            node.value = $('body').html(); // fix for cheerio v1
 
-            return resolve(node)
+            return resolve(node);
           })
       )
-    ).then(htmlImageNodes =>
-      markdownImageNodes.concat(htmlImageNodes).filter(node => !!node)
+    ).then((htmlImageNodes) =>
+      markdownImageNodes.concat(htmlImageNodes).filter((node) => !!node)
     )
-  )
-}
+  );
+};

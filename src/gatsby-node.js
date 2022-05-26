@@ -1,7 +1,10 @@
-const { Potrace } = require(`@gatsbyjs/potrace`)
+const { fetchProjectFiles } = require('./uploadcare-utils');
+const { CACHE_KEY_UC_FILES } = require('./utils');
 
-exports.pluginOptionsSchema = function ({ Joi }) {
-  return Joi.object({
+// Now pluginOptionsSchema not working, because it's sub-plugin of gatsby-plugin-mdx
+// TODO: make validation work
+exports.pluginOptionsSchema = ({ Joi }) => {
+  Joi.object({
     maxWidth: Joi.number()
       .default(650)
       .description(
@@ -31,7 +34,6 @@ exports.pluginOptionsSchema = function ({ Joi }) {
       ),
     wrapperStyle: Joi.alternatives().try(
       Joi.object({}).unknown(true),
-      Joi.function().maxArity(1),
       Joi.string()
     ),
     backgroundColor: Joi.string().default(`white`)
@@ -40,62 +42,6 @@ exports.pluginOptionsSchema = function ({ Joi }) {
       Note:
       - set this option to transparent for a transparent image background.
       - set this option to none to completely remove the image background.`),
-    quality: Joi.number()
-      .default(50)
-      .description(`The quality level of the generated files.`),
-    withWebp: Joi.alternatives()
-      .try(Joi.object({ quality: Joi.number() }), Joi.boolean())
-      .default(false)
-      .description(
-        `Additionally generate WebP versions alongside your chosen file format. They are added as a srcset with the appropriate mimetype and will be loaded in browsers that support the format. Pass true for default support, or an object of options to specifically override those for the WebP files. For example, pass { quality: 80 } to have the WebP images be at quality level 80.`
-      ),
-    withAvif: Joi.alternatives()
-      .try(Joi.object({ quality: Joi.number() }), Joi.boolean())
-      .default(false)
-      .description(
-        `Additionally generate AVIF versions alongside your chosen file format. They are added as a srcset with the appropriate mimetype and will be loaded in browsers that support the format. Pass true for default support, or an object of options to specifically override those for the AVIF files. For example, pass { quality: 80 } to have the AVIF images be at quality level 80.`
-      ),
-    tracedSVG: Joi.alternatives()
-      .try(
-        Joi.boolean(),
-        Joi.object({
-          turnPolicy: Joi.string()
-            .valid(
-              // this plugin also allow to use key names and not exact values
-              `TURNPOLICY_BLACK`,
-              `TURNPOLICY_WHITE`,
-              `TURNPOLICY_LEFT`,
-              `TURNPOLICY_RIGHT`,
-              `TURNPOLICY_MINORITY`,
-              `TURNPOLICY_MAJORITY`,
-              // it also allow using actual policy values
-              Potrace.TURNPOLICY_BLACK,
-              Potrace.TURNPOLICY_WHITE,
-              Potrace.TURNPOLICY_LEFT,
-              Potrace.TURNPOLICY_RIGHT,
-              Potrace.TURNPOLICY_MINORITY,
-              Potrace.TURNPOLICY_MAJORITY
-            )
-            .default(Potrace.TURNPOLICY_MAJORITY),
-          turdSize: Joi.number().default(100),
-          alphaMax: Joi.number(),
-          optCurve: Joi.boolean().default(true),
-          optTolerance: Joi.number().default(0.4),
-          threshold: Joi.alternatives()
-            .try(
-              Joi.number().min(0).max(255),
-              Joi.number().valid(Potrace.THRESHOLD_AUTO)
-            )
-            .default(Potrace.THRESHOLD_AUTO),
-          blackOnWhite: Joi.boolean().default(true),
-          color: Joi.string().default(`lightgray`),
-          background: Joi.string().default(`transparent`),
-        })
-      )
-      .default(false)
-      .description(
-        `Use traced SVGs for placeholder images instead of the “blur up” effect. Pass true for traced SVGs with the default settings (seen here), or an object of options to override the default. For example, pass { color: "#F00", turnPolicy: "TURNPOLICY_MAJORITY" } to change the color of the trace to red and the turn policy to TURNPOLICY_MAJORITY. See node-potrace parameter documentation for a full listing and explanation of the available options.`
-      ),
     loading: Joi.string()
       .valid(`lazy`, `eager`, `auto`)
       .default(`lazy`)
@@ -123,5 +69,39 @@ exports.pluginOptionsSchema = function ({ Joi }) {
       .description(
         `By default gatsby generates 0.25x, 0.5x, 1x, 1.5x, 2x, and 3x sizes of thumbnails. If you want more control over which sizes are output you can use the srcSetBreakpoints parameter. For example, if you want images that are 200, 340, 520, and 890 wide you can add srcSetBreakpoints: [ 200, 340, 520, 890 ] as a parameter. You will also get maxWidth as a breakpoint (which is 650 by default), so you will actually get [ 200, 340, 520, 650, 890 ] as breakpoints.`
       ),
-  })
-}
+    pubkey: Joi.string()
+      .required()
+      .description(
+        `The main use of a pubkey is to identify a target project for your uploads. It is required when using Upload API. 3000 uploads, 30 GB traffic and 3 GB storage - FREE. https://uploadcare.com/docs/start/settings/#keys-public`
+      ),
+    secretKey: Joi.string()
+      .required()
+      .description(
+        `A secretKey is required when using our REST API to manage files. 3000 uploads, 30 GB traffic and 3 GB storage - FREE. https://uploadcare.com/docs/start/settings/#keys-secret`
+      ),
+    imageOperations: Joi.object({})
+      .default({
+        quality: 'smart',
+        format: 'auto',
+      })
+      .required()
+      .description(
+        `With Uploadcare, you can easily build custom image transformation workflows and automate most of image manipulation and optimization tasks. https://uploadcare.com/docs/transformations/image/`
+      ),
+  });
+};
+
+exports.onPreBootstrap = async ({ cache }, pluginOptions) => {
+  const { pubkey, secretKey } = pluginOptions;
+
+  if (pubkey && secretKey) {
+    const files = await fetchProjectFiles(
+      pluginOptions.pubkey,
+      pluginOptions.secretKey
+    );
+
+    await cache.set(CACHE_KEY_UC_FILES, files);
+  } else {
+    throw new Error('pubkey and secretKey are required options.');
+  }
+};
