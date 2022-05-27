@@ -37,6 +37,7 @@ const supportedExtensions = {
   tif: true,
   tiff: true,
   gif: true,
+  svg: true
 };
 
 const getOptimizedImageData = ({
