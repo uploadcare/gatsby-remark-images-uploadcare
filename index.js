@@ -308,12 +308,13 @@ module.exports = async (
 
     if (noProcess) {
       const dir = path.join(process.cwd(), 'public', 'static', imageNode.internal.contentDigest);
+      const output = path.join(dir, imageNodeName);
 
       if (!(await exists(dir))) {
         await mkdir(dir, { recursive: true });
       }
-      if (!(await exists(imagePath))) {
-        await copyFile(imagePath, path.join(dir, imageNodeName));
+      if (!(await exists(output))) {
+        await copyFile(imagePath, output);
       }
     }
 
