@@ -54,11 +54,6 @@ exports.pluginOptionsSchema = ({ Joi }) => {
       .description(
         `Set the browser’s native decoding attribute. One of async, sync or auto.`
       ),
-    disableBgImageOnAlpha: Joi.boolean()
-      .default(false)
-      .description(
-        `Images containing transparent pixels around the edges results in images with blurry edges. As a result, these images do not work well with the “blur up” technique used in this plugin. As a workaround to disable background images with blurry edges on images containing transparent pixels, enable this setting.`
-      ),
     disableBgImage: Joi.boolean()
       .default(false)
       .description(

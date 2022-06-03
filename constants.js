@@ -7,7 +7,6 @@ exports.DEFAULT_OPTIONS = {
   markdownCaptions: false,
   loading: 'lazy',
   decoding: 'async',
-  disableBgImageOnAlpha: false,
   disableBgImage: false,
   imageOperations: {
     quality: 'smart',
@@ -20,6 +19,7 @@ exports.EMPTY_ALT = 'GATSBY_EMPTY_ALT';
 // see https://uploadcare.com/docs/transformations/#dimensions
 exports.UPLOADCARE_CDN_MAX_DIMENSION_DEFAULT = 3000; // px
 exports.UPLOADCARE_CDN = 'https://ucarecdn.com';
+exports.BASE_64_WIDTH_IN_PX = 20;
 
 exports.imageClass = 'gatsby-resp-image-image';
 exports.imageWrapperClass = 'gatsby-resp-image-wrapper';

@@ -4,7 +4,6 @@ const path = require('path');
 const urlJoin = require('url-join');
 const queryString = require('query-string');
 const isRelativeUrl = require('is-relative-url');
-const { stats, base64 } = require('gatsby-plugin-sharp');
 const cheerio = require('cheerio');
 const slash = require('slash');
 
@@ -14,10 +13,14 @@ const {
   imageClass,
   imageBackgroundClass,
   imageWrapperClass,
-  UPLOADCARE_CDN,
-  UPLOADCARE_CDN_MAX_DIMENSION_DEFAULT,
+  UPLOADCARE_CDN
 } = require('./constants');
-const { uploadClient, compileUCCDNUrl } = require('./uploadcare-utils');
+const {
+  uploadClient,
+  compileUCCDNUrl,
+  getOptimizedImageData,
+  generateBase64,
+} = require('./uploadcare-utils');
 const {
   CACHE_KEY_UC_FILES,
   getProjectFilesFromCache,
@@ -26,7 +29,7 @@ const {
   sleep,
   escape,
   exists,
-  mkdir
+  mkdir,
 } = require('./utils');
 
 const supportedExtensions = {
@@ -37,95 +40,6 @@ const supportedExtensions = {
   tif: true,
   tiff: true,
   gif: true,
-  svg: true
-};
-
-const getOptimizedImageData = ({
-  src,
-  name,
-  width,
-  options,
-  imageOperations,
-}) => {
-  const { maxWidth } = options;
-
-  if (maxWidth < 1) {
-    throw new Error(
-      `${maxWidth} has to be a positive int larger than zero (> 0), now it's ${maxWidth}`
-    );
-  } // Create sizes (in width) for the image if no custom breakpoints are
-  // provided. If the max width of the container for the rendered markdown file
-  // is 800px, the sizes would then be: 200, 400, 800, 1200, 1600.
-  //
-  // This is enough sizes to provide close to the optimal image size for every
-  // device size / screen resolution while (hopefully) not requiring too much
-  // image processing time (Sharp has optimizations thankfully for creating
-  // multiple sizes of the same input file)
-
-  const fluidSizes = [maxWidth]; // use standard breakpoints if no custom breakpoints are specified
-
-  if (!options.srcSetBreakpoints || !options.srcSetBreakpoints.length) {
-    fluidSizes.push(maxWidth / 4, maxWidth / 2, maxWidth * 1.5, maxWidth * 2);
-  } else {
-    options.srcSetBreakpoints.forEach((breakpoint) => {
-      if (breakpoint < 1) {
-        throw new Error(
-          `All ints in srcSetBreakpoints should be positive ints larger than zero (> 0), found ${breakpoint}`
-        );
-      } // ensure no duplicates are added
-
-      if (fluidSizes.includes(breakpoint)) {
-        return;
-      }
-
-      fluidSizes.push(breakpoint);
-    });
-  }
-
-  let filteredSizes = [
-    ...fluidSizes.filter((size) => size < width),
-    width,
-  ].sort((a, b) => a - b);
-  // Add the original image to ensure the largest image possible
-  // is available for small images. Also so we can link to
-  // the original image.
-  // Queue sizes for processing.
-
-  const hasSizeLargerThenLimit =
-    filteredSizes[filteredSizes.length - 1] >
-    UPLOADCARE_CDN_MAX_DIMENSION_DEFAULT;
-  if (hasSizeLargerThenLimit) {
-    filteredSizes = [
-      ...filteredSizes.filter(
-        (size) => size <= UPLOADCARE_CDN_MAX_DIMENSION_DEFAULT
-      ),
-      UPLOADCARE_CDN_MAX_DIMENSION_DEFAULT,
-    ];
-  }
-
-  const presentationWidth = Math.min(width, maxWidth);
-  const sizes =
-    options.sizes ||
-    `(max-width: ${presentationWidth}px) 100vw, ${presentationWidth}px`;
-  const srcSet = filteredSizes
-    .map(
-      (size) =>
-        `${compileUCCDNUrl({
-          src,
-          fileName: name,
-          options: {
-            ...options.imageOperations,
-            ...imageOperations,
-            resize: `${size}x`,
-          },
-        })} ${Math.round(size)}w`
-    )
-    .join(`,\n`);
-
-  return {
-    sizes,
-    srcSet,
-  };
 };
 
 const uploadingMap = new Map();
@@ -147,7 +61,7 @@ module.exports = async (
     compiler,
     getCache,
     getRemarkFileDependency,
-    pathPrefix
+    pathPrefix,
   },
   pluginOptions
 ) => {
@@ -202,8 +116,8 @@ module.exports = async (
       const captionOptions = Array.isArray(options.showCaptions)
         ? options.showCaptions
         : options.showCaptions === true
-        ? [`title`, `alt`]
-        : false;
+          ? [`title`, `alt`]
+          : false;
 
       if (captionOptions) {
         for (const option of captionOptions) {
@@ -266,7 +180,7 @@ module.exports = async (
         tempParentNode &&
         tempParentNode.internal &&
         tempParentNode.internal.type !== `File`
-      ) {
+        ) {
         tempParentNode = getNode(tempParentNode.parent);
       }
       if (
@@ -304,10 +218,18 @@ module.exports = async (
 
     const imageNodeName = `${imageNode.name}.${imageNode.extension}`;
     const { query: imageOperations } = queryString.parseUrl(node.url);
-    const noProcess = Object.prototype.hasOwnProperty.call(imageOperations, 'noProcess');
+    const noProcess = Object.prototype.hasOwnProperty.call(
+      imageOperations,
+      'noProcess'
+    );
 
     if (noProcess) {
-      const dir = path.join(process.cwd(), 'public', 'static', imageNode.internal.contentDigest);
+      const dir = path.join(
+        process.cwd(),
+        'public',
+        'static',
+        imageNode.internal.contentDigest
+      );
       const output = path.join(dir, imageNodeName);
 
       if (!(await exists(dir))) {
@@ -389,14 +311,11 @@ module.exports = async (
       (ucImg.content_info && ucImg.content_info.image) ||
       (ucImg.contentInfo && ucImg.contentInfo.image);
 
-    const imageName = (ucImg.original_file_url || ucImg.originalFilename)
-      .split('/')
-      .slice(-1)[0];
     const imageUrl = urlJoin(UPLOADCARE_CDN, ucImg.uuid);
 
     const optimizedImageUrl = compileUCCDNUrl({
       src: imageUrl,
-      fileName: imageName,
+      fileName: imageNodeName,
       options: {
         ...options.imageOperations,
         ...imageOperations,
@@ -405,7 +324,7 @@ module.exports = async (
     });
 
     const { srcSet, sizes } = getOptimizedImageData({
-      name: imageName,
+      name: imageNodeName,
       src: imageUrl,
       width: image.width,
       options,
@@ -467,19 +386,21 @@ module.exports = async (
       imageTag = `
       <video class="${imageClass}" style="${imageStyle}" autoplay loop webkit-playsinline playsinline muted>
         <source src="${urlJoin(
-          imageUrl,
-          '/gif2video/-/format/webm/'
-        )}" type="video/webm"/>
+        imageUrl,
+        '/gif2video/-/format/webm/'
+      )}" type="video/webm"/>
         <source src="${urlJoin(
-          imageUrl,
-          '/gif2video/-/format/mp4/'
-        )}" type="video/mp4"/>
+        imageUrl,
+        '/gif2video/-/format/mp4/'
+      )}" type="video/mp4"/>
       </video>
     `.trim();
     }
 
     if (noProcess) {
-      const prefixedSrc = `${pathPrefix || ``  }/static/${imageNode.internal.contentDigest}/${imageNodeName}`;
+      const prefixedSrc = `${pathPrefix || ``}/static/${
+        imageNode.internal.contentDigest
+      }/${imageNodeName}`;
 
       imageTag = `
       <img
@@ -494,21 +415,15 @@ module.exports = async (
     `.trim();
     }
 
-    const base64Image = await base64({
-      file: imageNode,
-      reporter,
-      cache,
+    const base64Image = await generateBase64({
+      imageUrl,
+      imageName: imageNodeName,
     });
-
     // Construct new image node w/ aspect ratio placeholder
     const imageCaption =
       options.showCaptions && (await getImageCaption(node, overWrites));
 
     let removeBgImage = false;
-    if (options.disableBgImageOnAlpha) {
-      const imageStats = await stats({ file: imageNode, reporter });
-      if (imageStats && imageStats.isTransparent) removeBgImage = true;
-    }
     if (options.disableBgImage) {
       removeBgImage = true;
     }
@@ -519,7 +434,7 @@ module.exports = async (
 
     const bgImage = removeBgImage
       ? ``
-      : ` background-image: url('${base64Image.src}'); background-size: cover;`;
+      : ` background-image: url('${base64Image}'); background-size: cover;`;
 
     let rawHTML = `
   <span
@@ -534,7 +449,7 @@ module.exports = async (
       rawHTML = `
   <a
     class="gatsby-resp-image-link"
-    href="${urlJoin(imageUrl, imageName)}"
+    href="${urlJoin(imageUrl, imageNodeName)}"
     style="display: block"
     target="_blank"
     rel="noopener"

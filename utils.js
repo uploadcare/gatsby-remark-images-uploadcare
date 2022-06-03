@@ -28,7 +28,7 @@ const escape = (string) => {
     '<': '&lt;',
     '>': '&gt;',
     '"': '&quot;',
-    "'": '&#39;',
+    '\'': '&#39;',
   };
 
   if (string && reUnescapedHtml.test(string)) {
@@ -48,5 +48,5 @@ module.exports = {
   readFile,
   copyFile,
   exists,
-  mkdir
+  mkdir,
 };
