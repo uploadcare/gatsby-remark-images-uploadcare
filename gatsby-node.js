@@ -86,17 +86,20 @@ exports.pluginOptionsSchema = ({ Joi }) => {
   });
 };
 
-exports.onPreBootstrap = async ({ cache }, pluginOptions) => {
-  const { pubkey, secretKey } = pluginOptions;
+let pubkey;
+let secretKey;
 
-  if (pubkey && secretKey) {
-    const files = await fetchProjectFiles(
-      pluginOptions.pubkey,
-      pluginOptions.secretKey
-    );
+exports.onPreInit = (_, pluginOptions) => {
+  ({ pubkey, secretKey } = pluginOptions);
+  // Do not leak secretKey to public bundle.
+  delete pluginOptions.secretKey; // eslint-disable-line no-param-reassign
+};
 
-    await cache.set(CACHE_KEY_UC_FILES, files);
-  } else {
+exports.onPreBootstrap = async ({ cache }) => {
+  if (!pubkey || !secretKey) {
     throw new Error('pubkey and secretKey are required options.');
   }
+
+  const files = await fetchProjectFiles(pubkey, secretKey);
+  await cache.set(CACHE_KEY_UC_FILES, files);
 };
