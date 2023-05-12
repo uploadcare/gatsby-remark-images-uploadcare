@@ -303,7 +303,7 @@ module.exports = async (
     }
 
     if (!ucImg) {
-      resolve();
+     return resolve();
     }
 
     // difference response in res-api(/files) and UploadClient(@uploadcare/upload-client)
